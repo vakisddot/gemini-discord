@@ -9,6 +9,29 @@ import {
 import { GoogleGenAI } from "@google/genai";
 
 // ---------------------------------------------------------------------------
+// Logger with colors
+// ---------------------------------------------------------------------------
+const colors = {
+  reset: "\x1b[0m",
+  dim: "\x1b[2m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  cyan: "\x1b[36m",
+  red: "\x1b[31m",
+  magenta: "\x1b[35m",
+};
+
+function log(message) {
+  const timestamp = new Date().toLocaleString();
+  console.log(`${colors.dim}[${timestamp}]${colors.reset} ${message}`);
+}
+
+function logError(message, error) {
+  const timestamp = new Date().toLocaleString();
+  console.error(`${colors.dim}[${timestamp}]${colors.reset} ${colors.red}ERROR: ${message}${colors.reset}`, error);
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -17,8 +40,8 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID || !GEMINI_API_KEY) {
-  console.error(
-    "Missing environment variables. Make sure DISCORD_TOKEN, DISCORD_CLIENT_ID, and GEMINI_API_KEY are set in your .env file."
+  logError(
+    "Missing environment variables. Make sure DISCORD_TOKEN, DISCORD_CLIENT_ID, and GEMINI_API_KEY are set in your .env file.", ""
   );
   process.exit(1);
 }
@@ -50,7 +73,8 @@ const geminiCommand = new SlashCommandBuilder()
 // Register slash commands when the bot is ready
 // ---------------------------------------------------------------------------
 client.once("clientReady", async () => {
-    console.log(`Logged in as ${client.user.tag}`);
+    log(`${colors.green}Logged in as ${client.user.tag}${colors.reset}`);
+    log(`${colors.cyan}Using model: ${GEMINI_MODEL}${colors.reset}`);
 
     const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
@@ -58,9 +82,9 @@ client.once("clientReady", async () => {
         await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), {
             body: [geminiCommand.toJSON()],
         });
-        console.log("Slash command /gemini registered successfully.");
+        log(`${colors.green}Slash command /gemini registered successfully.${colors.reset}`);
     } catch (error) {
-        console.error("Failed to register slash commands:", error);
+        logError("Failed to register slash commands:", error);
     }
 });
 
@@ -106,31 +130,46 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName !== "gemini") return;
 
   const prompt = interaction.options.getString("prompt");
+  const user = interaction.user.displayName;
+  const guild = interaction.guild?.name || "DM";
+
+  log(`${colors.cyan}[${guild}]${colors.reset} ${colors.magenta}${user}${colors.reset} asked: "${prompt}"`);
 
   // Defer the reply so Discord doesn't time out after 3 seconds
   await interaction.deferReply();
 
   try {
+    const startTime = Date.now();
+
     const response = await ai.models.generateContent({
       model: GEMINI_MODEL,
       contents: prompt,
     });
 
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     const text = response.text;
 
     if (!text) {
+      log(`${colors.yellow}[${guild}] Empty response for "${prompt}" (${elapsed}s)${colors.reset}`);
       await interaction.editReply(
         "Gemini returned an empty response. Try rephrasing your prompt."
       );
       return;
     }
 
+    log(`${colors.green}[${guild}] Response: ${text.length} chars in ${elapsed}s${colors.reset}`);
+    log(`${colors.magenta}[${guild}] Gemini reply:\n${text}${colors.reset}`);
+
     // Prepend the user's prompt so it's visible in the reply
-    const header = `**${interaction.user.displayName} asked:** ${prompt}\n\n`;
+    const header = `> **${interaction.user.displayName} asked:** ${prompt}\n\n`;
     const fullText = header + text;
 
     // Split long responses into multiple messages
     const chunks = splitMessage(fullText);
+
+    if (chunks.length > 1) {
+      log(`${colors.yellow}[${guild}] Response split into ${chunks.length} messages${colors.reset}`);
+    }
 
     // First chunk goes as the edit to the deferred reply
     await interaction.editReply(chunks[0]);
@@ -140,7 +179,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.followUp(chunks[i]);
     }
   } catch (error) {
-    console.error("Gemini API error:", error);
+    logError(`[${guild}] Gemini API failed for "${prompt}":`, error);
     await interaction.editReply(
       "❌ Sorry, something went wrong while contacting Gemini. Please try again later."
     );
