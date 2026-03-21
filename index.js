@@ -1,6 +1,7 @@
 import "dotenv/config";
 import {
   Client,
+  ChannelType,
   GatewayIntentBits,
   REST,
   Routes,
@@ -39,6 +40,9 @@ const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
+const SYSTEM_INSTRUCTION =
+  "You are a helpful assistant in a Discord server. Keep responses concise and to the point — ideally under 500 characters. Use short paragraphs and bullet points when appropriate. Avoid long introductions or unnecessary detail.";
+
 if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID || !GEMINI_API_KEY) {
   logError(
     "Missing environment variables. Make sure DISCORD_TOKEN, DISCORD_CLIENT_ID, and GEMINI_API_KEY are set in your .env file.", ""
@@ -52,12 +56,29 @@ if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID || !GEMINI_API_KEY) {
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 // ---------------------------------------------------------------------------
-// Google Gemini
+// Google Gemini — Chat sessions per channel
 // ---------------------------------------------------------------------------
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+const channelChats = new Map();
+
+function getOrCreateChat(channelId) {
+  if (channelChats.has(channelId)) {
+    return channelChats.get(channelId);
+  }
+
+  const chat = ai.chats.create({
+    model: GEMINI_MODEL,
+    config: {
+      systemInstruction: SYSTEM_INSTRUCTION,
+    },
+  });
+
+  channelChats.set(channelId, chat);
+  return chat;
+}
 
 // ---------------------------------------------------------------------------
-// Slash command definition
+// Slash command definitions
 // ---------------------------------------------------------------------------
 const geminiCommand = new SlashCommandBuilder()
   .setName("gemini")
@@ -69,23 +90,27 @@ const geminiCommand = new SlashCommandBuilder()
       .setRequired(true)
   );
 
+const resetCommand = new SlashCommandBuilder()
+  .setName("gemini-reset")
+  .setDescription("Reset Gemini conversation history for this channel");
+
 // ---------------------------------------------------------------------------
 // Register slash commands when the bot is ready
 // ---------------------------------------------------------------------------
 client.once("clientReady", async () => {
-    log(`${colors.green}Logged in as ${client.user.tag}${colors.reset}`);
-    log(`${colors.cyan}Using model: ${GEMINI_MODEL}${colors.reset}`);
+  log(`${colors.green}Logged in as ${client.user.tag}${colors.reset}`);
+  log(`${colors.cyan}Using model: ${GEMINI_MODEL}${colors.reset}`);
 
-    const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
-    try {
-        await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), {
-            body: [geminiCommand.toJSON()],
-        });
-        log(`${colors.green}Slash command /gemini registered successfully.${colors.reset}`);
-    } catch (error) {
-        logError("Failed to register slash commands:", error);
-    }
+  try {
+    await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), {
+      body: [geminiCommand.toJSON(), resetCommand.toJSON()],
+    });
+    log(`${colors.green}Slash commands /gemini and /gemini-reset registered successfully.${colors.reset}`);
+  } catch (error) {
+    logError("Failed to register slash commands:", error);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -93,10 +118,6 @@ client.once("clientReady", async () => {
 // ---------------------------------------------------------------------------
 const DISCORD_MAX_LENGTH = 2000;
 
-/**
- * Split a long string into chunks that each fit within Discord's message
- * character limit.
- */
 function splitMessage(text, maxLength = DISCORD_MAX_LENGTH) {
   const chunks = [];
   let remaining = text;
@@ -107,14 +128,11 @@ function splitMessage(text, maxLength = DISCORD_MAX_LENGTH) {
       break;
     }
 
-    // Try to split at the last newline within the limit so we don't cut mid-sentence
     let splitIndex = remaining.lastIndexOf("\n", maxLength);
     if (splitIndex === -1 || splitIndex === 0) {
-      // Fall back to splitting at a space
       splitIndex = remaining.lastIndexOf(" ", maxLength);
     }
     if (splitIndex === -1 || splitIndex === 0) {
-      // No good break point — hard cut
       splitIndex = maxLength;
     }
 
@@ -127,25 +145,38 @@ function splitMessage(text, maxLength = DISCORD_MAX_LENGTH) {
 
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
+
+  // -----------------------------------------------------------------------
+  // /gemini-reset
+  // -----------------------------------------------------------------------
+  if (interaction.commandName === "gemini-reset") {
+    const guild = interaction.guild?.name || "DM";
+    const channelId = interaction.channelId;
+
+    channelChats.delete(channelId);
+    log(`${colors.yellow}[${guild}] Conversation reset by ${interaction.user.displayName}${colors.reset}`);
+    await interaction.reply("Conversation history has been reset for this channel.");
+    return;
+  }
+
+  // -----------------------------------------------------------------------
+  // /gemini
+  // -----------------------------------------------------------------------
   if (interaction.commandName !== "gemini") return;
 
   const prompt = interaction.options.getString("prompt");
   const user = interaction.user.displayName;
   const guild = interaction.guild?.name || "DM";
+  const channelId = interaction.channelId;
 
   log(`${colors.cyan}[${guild}]${colors.reset} ${colors.magenta}${user}${colors.reset} asked: "${prompt}"`);
 
-  // Defer the reply so Discord doesn't time out after 3 seconds
   await interaction.deferReply();
 
   try {
     const startTime = Date.now();
-
-    const response = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: prompt,
-    });
-
+    const chat = getOrCreateChat(channelId);
+    const response = await chat.sendMessage({ message: prompt });
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     const text = response.text;
 
@@ -160,23 +191,31 @@ client.on("interactionCreate", async (interaction) => {
     log(`${colors.green}[${guild}] Response: ${text.length} chars in ${elapsed}s${colors.reset}`);
     log(`${colors.magenta}[${guild}] Gemini reply:\n${text}${colors.reset}`);
 
-    // Prepend the user's prompt so it's visible in the reply
-    const header = `> **${interaction.user.displayName} asked:** ${prompt}\n\n`;
+    const header = `> **${user} asked:** ${prompt}\n\n`;
     const fullText = header + text;
 
-    // Split long responses into multiple messages
-    const chunks = splitMessage(fullText);
-
-    if (chunks.length > 1) {
-      log(`${colors.yellow}[${guild}] Response split into ${chunks.length} messages${colors.reset}`);
+    // If it fits in one message, reply directly
+    if (fullText.length <= DISCORD_MAX_LENGTH) {
+      await interaction.editReply(fullText);
+      return;
     }
 
-    // First chunk goes as the edit to the deferred reply
-    await interaction.editReply(chunks[0]);
+    // Long response — create a thread
+    log(`${colors.yellow}[${guild}] Response too long (${text.length} chars), creating thread${colors.reset}`);
 
-    // Remaining chunks are sent as follow-up messages
-    for (let i = 1; i < chunks.length; i++) {
-      await interaction.followUp(chunks[i]);
+    const threadName = prompt.length > 100 ? prompt.slice(0, 97) + "..." : prompt;
+    await interaction.editReply(`${header}Response is long — check the thread below.`);
+
+    const replyMessage = await interaction.fetchReply();
+    const thread = await replyMessage.startThread({
+      name: threadName,
+      autoArchiveDuration: 60,
+      type: ChannelType.PublicThread,
+    });
+
+    const chunks = splitMessage(text);
+    for (const chunk of chunks) {
+      await thread.send(chunk);
     }
   } catch (error) {
     logError(`[${guild}] Gemini API failed for "${prompt}":`, error);
