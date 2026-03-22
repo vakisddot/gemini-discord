@@ -274,7 +274,17 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("Bot is running");
 });
-server.listen(process.env.PORT || 3000);
+const PORT = process.env.PORT || 3000;
+server.listen(PORT);
+
+// Keep-alive: ping ourselves every 10 minutes so Render doesn't spin down
+setInterval(() => {
+    http.get(`http://localhost:${PORT}`, () => {
+        log(`${colors.dim}Keep-alive ping sent${colors.reset}`);
+    }).on("error", (err) => {
+        logError("Keep-alive ping failed:", err);
+    });
+}, 10 * 60 * 1000);
 
 // ---------------------------------------------------------------------------
 // Start the bot
